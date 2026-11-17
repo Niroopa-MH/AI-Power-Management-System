@@ -1,0 +1,54 @@
+"""AI Power Management System
+Forecasts electricity demand with ML, then schedules a battery
+(charge off-peak, discharge on-peak) to cut the energy bill.
+"""
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
+
+rng = np.random.default_rng(42)
+
+# ---------- 1. Synthetic smart-meter data (replace with your real CSV) ----------
+def make_data(days=90):
+    t = pd.date_range("2025-01-01", periods=days * 24, freq="h")
+    temp = np.asarray(25 + 6 * np.sin(2 * np.pi * (t.hour - 9) / 24)) + rng.normal(0, 1, len(t))
+    load = (2 + 1.5 * np.exp(-((t.hour - 19) ** 2) / 8)      # evening peak
+            + 0.8 * np.exp(-((t.hour - 8) ** 2) / 6)         # morning peak
+            + 0.1 * np.clip(temp - 25, 0, None) + 0.3 * np.asarray(t.dayofweek >= 5)
+            + rng.normal(0, 0.15, len(t)))
+    return pd.DataFrame({"hour": t.hour, "dow": t.dayofweek, "temp": temp, "load": load}, index=t)
+
+def add_features(df):
+    df = df.copy()
+    df["lag1"], df["lag24"] = df["load"].shift(1), df["load"].shift(24)
+    return df.dropna()
+
+# ---------- 2. Demand forecasting ----------
+df = add_features(make_data())
+X, y = df[["hour", "dow", "temp", "lag1", "lag24"]], df["load"]
+split = int(len(df) * 0.8)
+model = GradientBoostingRegressor().fit(X[:split], y[:split])
+test = df.iloc[split:].copy()
+test["forecast"] = model.predict(X[split:])
+print(f"Forecast MAE: {mean_absolute_error(test.load, test.forecast):.3f} kW")
+
+# ---------- 3. Battery scheduler (uses the forecast) ----------
+CAP, RATE = 10.0, 3.0                       # battery kWh, max kW
+price = lambda h: 0.30 if 17 <= h < 22 else (0.08 if h < 6 else 0.15)  # $/kWh
+
+soc, cost_ai, cost_base = CAP / 2, 0.0, 0.0
+peak_cut = test.forecast.quantile(0.75)     # "high demand" threshold
+for ts, r in test.iterrows():
+    p, load = price(ts.hour), r.load
+    if p >= 0.30 or r.forecast > peak_cut:  # expensive/high demand -> discharge
+        use = min(RATE, soc, load); soc -= use; grid = load - use
+    elif p <= 0.08:                         # cheap -> charge
+        add = min(RATE, CAP - soc); soc += add; grid = load + add
+    else:
+        grid = load
+    cost_ai += grid * p
+    cost_base += load * p
+
+saving = 100 * (cost_base - cost_ai) / cost_base
+print(f"Baseline cost: ${cost_base:.2f} | AI-managed: ${cost_ai:.2f} | Saved: {saving:.1f}%")
